@@ -79,7 +79,111 @@ def apply_rope(value: torch.Tensor, rope: torch.Tensor) -> torch.Tensor:
     return rotated.flatten(-2).to(value.dtype)
 
 
-def flash_attention_varlen(
+_ATTENTION_BACKEND_CACHE: tuple[str, str] | None = None
+
+
+def _requested_attention_backend() -> str:
+    return os.environ.get("ZING_ATTENTION_BACKEND", "auto").strip().lower() or "auto"
+
+
+def _flash_attn_varlen_func():
+    from flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func
+
+
+def _resolve_attention_backend() -> str:
+    global _ATTENTION_BACKEND_CACHE
+    requested = _requested_attention_backend()
+    if _ATTENTION_BACKEND_CACHE is not None and _ATTENTION_BACKEND_CACHE[0] == requested:
+        return _ATTENTION_BACKEND_CACHE[1]
+    allowed = {"auto", "flash", "sdpa", "sdpa-math"}
+    if requested not in allowed:
+        raise ValueError(f"unsupported ZING_ATTENTION_BACKEND={requested!r}; expected one of {sorted(allowed)}")
+    flash_available = True
+    try:
+        _flash_attn_varlen_func()
+    except ImportError:
+        flash_available = False
+    if requested == "flash":
+        if not flash_available:
+            raise ImportError("ZING_ATTENTION_BACKEND=flash requires the CUDA flash-attn package")
+        resolved = "flash"
+    elif requested in {"sdpa", "sdpa-math"}:
+        resolved = requested
+    else:
+        resolved = "flash" if flash_available else "sdpa"
+    _ATTENTION_BACKEND_CACHE = (requested, resolved)
+    return resolved
+
+
+def _scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    math_only: bool,
+) -> torch.Tensor:
+    kwargs = {"dropout_p": 0.0, "is_causal": False}
+    if math_only:
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+        except ImportError:
+            return F.scaled_dot_product_attention(query, key, value, **kwargs)
+        with sdpa_kernel(SDPBackend.MATH):
+            return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    return F.scaled_dot_product_attention(query, key, value, **kwargs)
+
+
+def _sdpa_attention_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lengths: torch.Tensor,
+    key_lengths: torch.Tensor,
+    *,
+    math_only: bool,
+) -> torch.Tensor:
+    if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
+        raise ValueError("packed attention tensors must have shape (total, heads, dim)")
+    if query.shape[1:] != key.shape[1:] or key.shape[1:] != value.shape[1:]:
+        raise ValueError("query, key, and value head shapes must match")
+    query_lengths = query_lengths.to(device=query.device, dtype=torch.int64)
+    key_lengths = key_lengths.to(device=key.device, dtype=torch.int64)
+    if query_lengths.ndim != 1 or key_lengths.ndim != 1 or query_lengths.numel() != key_lengths.numel():
+        raise ValueError("query_lengths and key_lengths must be 1-D and the same batch size")
+    if int(query_lengths.sum().item()) != query.shape[0] or int(key_lengths.sum().item()) != key.shape[0]:
+        raise ValueError("packed token counts must match the length tensors")
+    batch = int(query_lengths.numel())
+    heads, dim = query.shape[1], query.shape[2]
+    max_query = int(query_lengths.max().item())
+    max_key = int(key_lengths.max().item())
+    equal_query = bool((query_lengths == max_query).all().item())
+    equal_key = bool((key_lengths == max_key).all().item())
+    if equal_query and equal_key:
+        packed_query = query.view(batch, max_query, heads, dim).transpose(1, 2)
+        packed_key = key.view(batch, max_key, heads, dim).transpose(1, 2)
+        packed_value = value.view(batch, max_key, heads, dim).transpose(1, 2)
+        attended = _scaled_dot_product_attention(packed_query, packed_key, packed_value, math_only=math_only)
+        return attended.transpose(1, 2).reshape(query.shape)
+
+    outputs = []
+    query_offset = 0
+    key_offset = 0
+    for index in range(batch):
+        query_len = int(query_lengths[index].item())
+        key_len = int(key_lengths[index].item())
+        sample_query = query[query_offset : query_offset + query_len].unsqueeze(0).transpose(1, 2)
+        sample_key = key[key_offset : key_offset + key_len].unsqueeze(0).transpose(1, 2)
+        sample_value = value[key_offset : key_offset + key_len].unsqueeze(0).transpose(1, 2)
+        attended = _scaled_dot_product_attention(sample_query, sample_key, sample_value, math_only=math_only)
+        outputs.append(attended.transpose(1, 2).squeeze(0))
+        query_offset += query_len
+        key_offset += key_len
+    return torch.cat(outputs, dim=0)
+
+
+def _flash_attention_varlen(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -87,8 +191,7 @@ def flash_attention_varlen(
     key_lengths: torch.Tensor,
     deterministic: bool,
 ) -> torch.Tensor:
-    from flash_attn import flash_attn_varlen_func
-
+    flash_attn_varlen_func = _flash_attn_varlen_func()
     cumulative_query = F.pad(query_lengths.to(torch.int32).cumsum(0), (1, 0)).to(torch.int32)
     cumulative_key = F.pad(key_lengths.to(torch.int32).cumsum(0), (1, 0)).to(torch.int32)
     return flash_attn_varlen_func(
@@ -103,6 +206,27 @@ def flash_attention_varlen(
         softmax_scale=None,
         causal=False,
         deterministic=deterministic,
+    )
+
+
+def flash_attention_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lengths: torch.Tensor,
+    key_lengths: torch.Tensor,
+    deterministic: bool,
+) -> torch.Tensor:
+    backend = _resolve_attention_backend()
+    if backend == "flash":
+        return _flash_attention_varlen(query, key, value, query_lengths, key_lengths, deterministic)
+    return _sdpa_attention_varlen(
+        query,
+        key,
+        value,
+        query_lengths,
+        key_lengths,
+        math_only=backend == "sdpa-math" or deterministic,
     )
 
 

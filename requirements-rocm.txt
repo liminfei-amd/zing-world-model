@@ -1,0 +1,20 @@
+# Python packages for the gfx1151 / ROCm path.
+# Do not install upstream requirements.txt: it pins CUDA torch==2.9.1 and
+# flash-attn==2.8.3.post1, which are not HIP wheels.
+#
+# Install order:
+#   1. Create a Python 3.11 venv.
+#   2. Install matching gfx1151 PyTorch from an AMD index (see docs/ROCM-GFX1151.md).
+#   3. pip install -r requirements-rocm.txt
+# Torch, torchvision, torchaudio, triton, and flash-attn are intentionally omitted.
+
+accelerate==1.13.0
+av==13.1.0
+diffusers==0.35.0
+numpy==2.2.6
+pillow==11.3.0
+PyYAML==6.0.3
+safetensors==0.4.5
+sentencepiece==0.2.1
+tqdm==4.67.1
+transformers==4.56.0
