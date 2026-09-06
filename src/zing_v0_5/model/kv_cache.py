@@ -219,3 +219,12 @@ class CausalKVCache:
             if action_current is not None:
                 current = action_current.detach()
                 self.action_history = current if self.action_history is None else torch.cat((self.action_history, current), dim=1)
+
+    def commit_active(self, action_current: torch.Tensor | None = None) -> None:
+        """Keep the last active-block KV without an extra t=0 generator forward."""
+        if self.active_start is None:
+            return
+        self.active_start = None
+        if action_current is not None:
+            current = action_current.detach()
+            self.action_history = current if self.action_history is None else torch.cat((self.action_history, current), dim=1)

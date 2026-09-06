@@ -1,0 +1,6 @@
+# Keep the HIP wheel if a later pip install wants torch.
+# Use: pip install -r requirements-rocm.txt -c constraints-rocm.txt \
+#   --extra-index-url https://stable.repo.amd.com/rocm/whl-next/
+torch==2.13.0+rocm10.0.0
+torchvision==0.28.0+rocm10.0.0
+torchaudio==2.11.0.2+rocm10.0.0

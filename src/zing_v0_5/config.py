@@ -179,3 +179,9 @@ def with_cache_window(
     sink = config.generator.sink_size if sink_size is None else int(sink_size)
     _validate_cache_window(local, sink, config.inference.frames_per_block)
     return replace(config, generator=replace(config.generator, local_attn_size=local, sink_size=sink))
+
+
+def with_compile_fusion(config: ZingConfig, enabled: bool | None) -> ZingConfig:
+    if enabled is None:
+        return config
+    return replace(config, generator=replace(config.generator, compile_fusion=bool(enabled)))

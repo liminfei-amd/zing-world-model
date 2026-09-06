@@ -97,7 +97,7 @@ def _resolve_attention_backend() -> str:
     requested = _requested_attention_backend()
     if _ATTENTION_BACKEND_CACHE is not None and _ATTENTION_BACKEND_CACHE[0] == requested:
         return _ATTENTION_BACKEND_CACHE[1]
-    allowed = {"auto", "flash", "sdpa", "sdpa-math"}
+    allowed = {"auto", "flash", "sdpa", "sdpa-math", "sdpa-flash", "sdpa-efficient"}
     if requested not in allowed:
         raise ValueError(f"unsupported ZING_ATTENTION_BACKEND={requested!r}; expected one of {sorted(allowed)}")
     flash_available = True
@@ -109,7 +109,7 @@ def _resolve_attention_backend() -> str:
         if not flash_available:
             raise ImportError("ZING_ATTENTION_BACKEND=flash requires the CUDA flash-attn package")
         resolved = "flash"
-    elif requested in {"sdpa", "sdpa-math"}:
+    elif requested in {"sdpa", "sdpa-math", "sdpa-flash", "sdpa-efficient"}:
         resolved = requested
     else:
         resolved = "flash" if flash_available else "sdpa"
@@ -117,22 +117,39 @@ def _resolve_attention_backend() -> str:
     return resolved
 
 
+def _sdpa_backend_name(resolved: str) -> str:
+    if resolved == "sdpa-math":
+        return "math"
+    if resolved == "sdpa-flash":
+        return "flash"
+    if resolved == "sdpa-efficient":
+        return "efficient"
+    return "auto"
+
+
 def _scaled_dot_product_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     *,
-    math_only: bool,
+    backend: str,
 ) -> torch.Tensor:
     kwargs = {"dropout_p": 0.0, "is_causal": False}
-    if math_only:
-        try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-        except ImportError:
-            return F.scaled_dot_product_attention(query, key, value, **kwargs)
-        with sdpa_kernel(SDPBackend.MATH):
-            return F.scaled_dot_product_attention(query, key, value, **kwargs)
-    return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    if backend == "auto":
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    mapping = {
+        "math": SDPBackend.MATH,
+        "flash": SDPBackend.FLASH_ATTENTION,
+        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+    }
+    if backend not in mapping:
+        raise ValueError(f"unsupported SDPA kernel {backend!r}")
+    with sdpa_kernel(mapping[backend]):
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
 
 
 def _sdpa_attention_varlen(
@@ -142,7 +159,7 @@ def _sdpa_attention_varlen(
     query_lengths: torch.Tensor,
     key_lengths: torch.Tensor,
     *,
-    math_only: bool,
+    backend: str,
 ) -> torch.Tensor:
     if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
         raise ValueError("packed attention tensors must have shape (total, heads, dim)")
@@ -164,7 +181,7 @@ def _sdpa_attention_varlen(
         packed_query = query.view(batch, max_query, heads, dim).transpose(1, 2)
         packed_key = key.view(batch, max_key, heads, dim).transpose(1, 2)
         packed_value = value.view(batch, max_key, heads, dim).transpose(1, 2)
-        attended = _scaled_dot_product_attention(packed_query, packed_key, packed_value, math_only=math_only)
+        attended = _scaled_dot_product_attention(packed_query, packed_key, packed_value, backend=backend)
         return attended.transpose(1, 2).reshape(query.shape)
 
     outputs = []
@@ -176,7 +193,7 @@ def _sdpa_attention_varlen(
         sample_query = query[query_offset : query_offset + query_len].unsqueeze(0).transpose(1, 2)
         sample_key = key[key_offset : key_offset + key_len].unsqueeze(0).transpose(1, 2)
         sample_value = value[key_offset : key_offset + key_len].unsqueeze(0).transpose(1, 2)
-        attended = _scaled_dot_product_attention(sample_query, sample_key, sample_value, math_only=math_only)
+        attended = _scaled_dot_product_attention(sample_query, sample_key, sample_value, backend=backend)
         outputs.append(attended.transpose(1, 2).squeeze(0))
         query_offset += query_len
         key_offset += key_len
@@ -226,7 +243,7 @@ def flash_attention_varlen(
         value,
         query_lengths,
         key_lengths,
-        math_only=backend == "sdpa-math" or deterministic,
+        backend="math" if deterministic else _sdpa_backend_name(backend),
     )
 
 
