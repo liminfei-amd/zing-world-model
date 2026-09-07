@@ -133,6 +133,8 @@ class WanAttentionBlock(nn.Module):
         context_lengths: torch.Tensor,
         self_history: tuple[torch.Tensor | None, torch.Tensor | None],
         cross_history: tuple[torch.Tensor | None, torch.Tensor | None],
+        cache=None,
+        layer: int | None = None,
     ) -> tuple[
         torch.Tensor,
         tuple[torch.Tensor, torch.Tensor],
@@ -147,7 +149,9 @@ class WanAttentionBlock(nn.Module):
             time_embedding.select(-2, 1),
             self.norm1.eps,
         )
-        attended, key, value = self.self_attn(normalized, rope[0], rope[1], self_history)
+        attended, key, value = self.self_attn(
+            normalized, rope[0], rope[1], self_history, cache=cache, layer=layer
+        )
         hidden = adaln(
             hidden,
             self.compile_fusion,
@@ -250,6 +254,7 @@ class WanModel(nn.Module):
             local_attn_size=self.config.local_attn_size,
             sink_size=self.config.sink_size,
             frames_per_block=self.frames_per_block,
+            rope_max_seq_len=self.rope_max_seq_len,
         )
 
     def _rope(self, positions: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -322,6 +327,8 @@ class WanModel(nn.Module):
                 context_lengths,
                 cache.history(index),
                 cache.cross(index),
+                cache,
+                index,
             )
             new_self.append(self_values)
             new_cross.append(cross_values)

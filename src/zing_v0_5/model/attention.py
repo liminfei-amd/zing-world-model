@@ -60,12 +60,18 @@ def make_rope_freqs(dim: int, num_heads: int, maximum: int) -> tuple[torch.Tenso
     return table(maximum, temporal_width), table(maximum, spatial_width), table(maximum, spatial_width)
 
 
+def _is_compiling() -> bool:
+    compiling = getattr(torch.compiler, "is_compiling", None)
+    return compiling is not None and compiling()
+
+
 def compute_rope(
     positions: torch.Tensor, temporal: torch.Tensor, height: torch.Tensor, width: torch.Tensor
 ) -> torch.Tensor:
-    maxima = positions.max(dim=0).values
-    if int(maxima[0]) >= temporal.shape[0] or int(maxima[1]) >= height.shape[0] or int(maxima[2]) >= width.shape[0]:
-        raise ValueError("RoPE position exceeds generator.rope_max_seq_len")
+    if not _is_compiling():
+        maxima = positions.max(dim=0).values
+        if int(maxima[0]) >= temporal.shape[0] or int(maxima[1]) >= height.shape[0] or int(maxima[2]) >= width.shape[0]:
+            raise ValueError("RoPE position exceeds generator.rope_max_seq_len")
     return torch.cat((temporal[positions[:, 0]], height[positions[:, 1]], width[positions[:, 2]]), dim=1)
 
 
@@ -165,6 +171,16 @@ def _sdpa_attention_varlen(
         raise ValueError("packed attention tensors must have shape (total, heads, dim)")
     if query.shape[1:] != key.shape[1:] or key.shape[1:] != value.shape[1:]:
         raise ValueError("query, key, and value head shapes must match")
+    batch = query_lengths.shape[0]
+    heads, dim = query.shape[1], query.shape[2]
+    if _is_compiling():
+        max_query = query.shape[0] // batch
+        max_key = key.shape[0] // batch
+        packed_query = query.view(batch, max_query, heads, dim).transpose(1, 2)
+        packed_key = key.view(batch, max_key, heads, dim).transpose(1, 2)
+        packed_value = value.view(batch, max_key, heads, dim).transpose(1, 2)
+        attended = _scaled_dot_product_attention(packed_query, packed_key, packed_value, backend=backend)
+        return attended.transpose(1, 2).reshape(query.shape)
     query_lengths = query_lengths.to(device=query.device, dtype=torch.int64)
     key_lengths = key_lengths.to(device=key.device, dtype=torch.int64)
     if query_lengths.ndim != 1 or key_lengths.ndim != 1 or query_lengths.numel() != key_lengths.numel():
@@ -172,7 +188,6 @@ def _sdpa_attention_varlen(
     if int(query_lengths.sum().item()) != query.shape[0] or int(key_lengths.sum().item()) != key.shape[0]:
         raise ValueError("packed token counts must match the length tensors")
     batch = int(query_lengths.numel())
-    heads, dim = query.shape[1], query.shape[2]
     max_query = int(query_lengths.max().item())
     max_key = int(key_lengths.max().item())
     equal_query = bool((query_lengths == max_query).all().item())
@@ -226,6 +241,10 @@ def _flash_attention_varlen(
     )
 
 
+def _stage_kv_enabled() -> bool:
+    return os.environ.get("ZING_STAGE_KV", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def flash_attention_varlen(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -268,6 +287,8 @@ class SelfAttention(nn.Module):
         query_rope: torch.Tensor,
         key_rope: torch.Tensor,
         history: tuple[torch.Tensor | None, torch.Tensor | None],
+        cache=None,
+        layer: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, sequence, _ = hidden.shape
         query = self.q(hidden)
@@ -278,9 +299,15 @@ class SelfAttention(nn.Module):
         query = query.reshape(batch, sequence, self.num_heads, self.head_dim)
         key = key.reshape(batch, sequence, self.num_heads, self.head_dim)
         value = self.v(hidden).reshape(batch, sequence, self.num_heads, self.head_dim)
-        history_key, history_value = history
-        raw_key = key if history_key is None else torch.cat((history_key, key), dim=1)
-        full_value = value if history_value is None else torch.cat((history_value, value), dim=1)
+        staged = None
+        if cache is not None and layer is not None and _stage_kv_enabled():
+            staged = cache.stage_current(layer, key, value)
+        if staged is not None:
+            raw_key, full_value = staged
+        else:
+            history_key, history_value = history
+            raw_key = key if history_key is None else torch.cat((history_key, key), dim=1)
+            full_value = value if history_value is None else torch.cat((history_value, value), dim=1)
         query = apply_rope(query, query_rope)
         rotated_key = apply_rope(raw_key, key_rope)
         key_sequence = rotated_key.shape[1]

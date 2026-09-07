@@ -24,6 +24,9 @@ class DmdScheduler:
         self.sigmas = self.sigmas.to(device)
         return self
 
+    def reset(self) -> None:
+        self.index = 0
+
     def step(self, model_output: torch.Tensor, sample: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = self.sigmas[self.index]
         x0 = sample.float() - sigma.float() * model_output.float()

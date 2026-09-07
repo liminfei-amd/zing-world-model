@@ -24,6 +24,8 @@ class CausalKVCache:
     first_block_id: int | None = None
     pinned_block_id: int = -1
     pending_pin_block_id: int = -1
+    kv_capacity: int | None = None
+    rope_max_seq_len: int = 1024
 
     def __post_init__(self) -> None:
         if self.local_attn_size == -1:
@@ -33,6 +35,30 @@ class CausalKVCache:
         local_blocks, sink_blocks = self._window_geometry()
         if self.local_attn_size < 1 or self.sink_size < 0 or local_blocks - sink_blocks < 2:
             raise ValueError("local attention window is invalid")
+
+    def allocate_window(
+        self,
+        tokens_per_frame: int,
+        num_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if self.local_attn_size < 1 or tokens_per_frame < 1:
+            raise ValueError("allocate_window requires a local attention window and tokens_per_frame")
+        max_frames = self.local_attn_size + self.sink_size + self.frames_per_block
+        self.kv_capacity = max_frames * tokens_per_frame
+        shape = (1, self.kv_capacity, num_heads, head_dim)
+        self.self_k = [torch.empty(shape, device=device, dtype=dtype) for _ in range(self.num_layers)]
+        self.self_v = [torch.empty(shape, device=device, dtype=dtype) for _ in range(self.num_layers)]
+        self.positions = None
+        self.block_ids = None
+        self.active_start = None
+        self.reserved_length = None
+
+    @property
+    def used_tokens(self) -> int:
+        return 0 if self.positions is None else int(self.positions.shape[0])
 
     @property
     def is_cold(self) -> bool:
@@ -70,12 +96,27 @@ class CausalKVCache:
         indices = self._visible_indices(query_block_id, local_end)
         if indices is None:
             return
+        used = int(indices.numel())
+        if self.kv_capacity is not None:
+            for collection in (self.self_k, self.self_v):
+                for tensor in collection:
+                    gathered = tensor[:, indices].contiguous()
+                    tensor[:, :used].copy_(gathered)
+            self.positions = self.positions[indices].contiguous()
+            self.block_ids = self.block_ids[indices].contiguous()
+            return
         self._release_unused_cuda_memory()
         for collection in (self.self_k, self.self_v):
             for index, value in enumerate(collection):
                 collection[index] = value[:, indices].contiguous()
         self.positions = self.positions[indices].contiguous()
         self.block_ids = self.block_ids[indices].contiguous()
+
+    def _reindex_temporal(self) -> None:
+        if self.positions is None or int(self.positions.shape[0]) == 0:
+            return
+        _, inverse = torch.unique(self.positions[:, 0], sorted=True, return_inverse=True)
+        self.positions[:, 0] = inverse.to(dtype=self.positions.dtype)
 
     def _release_unused_cuda_memory(self) -> None:
         if self.self_k is None or not self.self_k[0].is_cuda:
@@ -85,9 +126,25 @@ class CausalKVCache:
             torch.cuda.empty_cache()
 
     def history(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        if self.self_k is None:
+        if self.self_k is None or self.positions is None:
             return None, None
         end = self.active_start if self.active_start is not None else int(self.positions.shape[0])
+        return self.self_k[layer][:, :end], self.self_v[layer][:, :end]
+
+    def stage_current(self, layer: int, key: torch.Tensor, value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.kv_capacity is None or self.self_k is None:
+            return None
+        if self.positions is None:
+            start = 0
+        elif self.active_start is not None:
+            start = self.active_start
+        else:
+            start = int(self.positions.shape[0])
+        end = start + int(key.shape[1])
+        if end > self.kv_capacity:
+            return None
+        self.self_k[layer][:, start:end].copy_(key)
+        self.self_v[layer][:, start:end].copy_(value)
         return self.self_k[layer][:, :end], self.self_v[layer][:, :end]
 
     def cross(self, layer: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
@@ -135,7 +192,6 @@ class CausalKVCache:
                 raise ValueError("active cache block shape changed")
             block_id = int(self.block_ids[self.active_start])
             return self.positions[self.active_start:stop], block_id, action_window
-        start_frame = 0 if self.positions is None else int(self.positions[:, 0].max()) + 1
         start_block = 0 if self.block_ids is None else int(self.block_ids.max()) + 1
         if self.first_block_id is None:
             self.first_block_id = start_block
@@ -150,6 +206,10 @@ class CausalKVCache:
                 self.pinned_block_id = self.pending_pin_block_id
                 self.pending_pin_block_id = -1
             self._prune_for_query(start_block)
+            self._reindex_temporal()
+        start_frame = 0 if self.positions is None else int(self.positions[:, 0].max()) + 1
+        if start_frame + frames > self.rope_max_seq_len:
+            raise RuntimeError("RoPE temporal positions exceed generator.rope_max_seq_len")
         temporal = (torch.arange(frames, device=device) + start_frame).view(frames, 1, 1).expand(frames, height, width)
         vertical = torch.arange(height, device=device).view(1, height, 1).expand(frames, height, width)
         horizontal = torch.arange(width, device=device).view(1, 1, width).expand(frames, height, width)
@@ -190,8 +250,15 @@ class CausalKVCache:
                 self.self_k[index][:, self.active_start:stop].copy_(key)
                 self.self_v[index][:, self.active_start:stop].copy_(value)
         elif self.positions is None:
-            self.self_k = [key for key, _ in new_self]
-            self.self_v = [value for _, value in new_self]
+            if self.kv_capacity is not None:
+                if length > self.kv_capacity:
+                    raise RuntimeError("KV window overflow")
+                for index, (key, value) in enumerate(new_self):
+                    self.self_k[index][:, :length].copy_(key)
+                    self.self_v[index][:, :length].copy_(value)
+            else:
+                self.self_k = [key for key, _ in new_self]
+                self.self_v = [value for _, value in new_self]
             self.positions = positions
             self.block_ids = current_block_ids
             self.first_block_id = block_id
@@ -199,8 +266,15 @@ class CausalKVCache:
             old_length = int(self.positions.shape[0])
             self.positions = torch.cat((self.positions, positions), dim=0)
             self.block_ids = torch.cat((self.block_ids, current_block_ids), dim=0)
-            if self.reserved_length is not None:
-                if self.reserved_length != old_length + length:
+            new_length = old_length + length
+            if self.kv_capacity is not None:
+                if new_length > self.kv_capacity:
+                    raise RuntimeError("KV window overflow")
+                for index, (key, value) in enumerate(new_self):
+                    self.self_k[index][:, old_length:new_length].copy_(key)
+                    self.self_v[index][:, old_length:new_length].copy_(value)
+            elif self.reserved_length is not None:
+                if self.reserved_length != new_length:
                     raise ValueError("cache reservation does not match the block")
                 for index, (key, value) in enumerate(new_self):
                     self.self_k[index][:, old_length:old_length + length].copy_(key)

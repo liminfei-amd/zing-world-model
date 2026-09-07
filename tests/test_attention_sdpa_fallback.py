@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import torch
 
-from zing_v0_5.model.attention import flash_attention_varlen
+from zing_v0_5.model.attention import compute_rope, flash_attention_varlen, make_rope_freqs
 
 
 def _naive_varlen(
@@ -62,6 +62,12 @@ class SdpaVarlenFallbackTests(unittest.TestCase):
         actual = flash_attention_varlen(query, key, value, query_lengths, key_lengths, True)
         expected = _naive_varlen(query, key, value, query_lengths, key_lengths)
         self.assertTrue(torch.allclose(actual.float(), expected.float(), atol=1e-5, rtol=1e-4))
+
+    def test_compute_rope_rejects_overflow(self) -> None:
+        temporal, height, width = make_rope_freqs(24, 4, 8)
+        positions = torch.tensor([[9, 0, 0]])
+        with self.assertRaises(ValueError):
+            compute_rope(positions, temporal, height, width)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from .config import ZingConfig
+from .config import ZingConfig, with_compile_fusion
 from .model import WanModel, WanTextEncoder, WanVAE
 from .processor import InferenceRequest
 from .scheduler import DmdScheduler
@@ -29,6 +29,11 @@ class InferencePipeline:
         self.device = torch.device("cuda:0")
         self.skip_cache_final = _env_flag("ZING_SKIP_CACHE_FINAL")
         self.decode_per_block = _env_flag("ZING_DECODE_PER_BLOCK")
+        self.keep_text_encoder = _env_flag("ZING_KEEP_TEXT_ENCODER")
+        self.stream_vae = _env_flag("ZING_STREAM_VAE")
+        self.keep_vae = _env_flag("ZING_KEEP_VAE") or self.stream_vae
+        self.overlap_vae = _env_flag("ZING_OVERLAP_VAE") and self.stream_vae
+        self._vae_stream = torch.cuda.Stream() if self.overlap_vae else None
         self.last_bench: dict | None = None
         pretrained_path = Path(pretrained_dir)
         for name in ("text_encoder", "tokenizer", "vae"):
@@ -37,15 +42,22 @@ class InferencePipeline:
         checkpoint_path = Path(checkpoint)
         if checkpoint_path.suffix != ".pt" or not checkpoint_path.is_file():
             raise ValueError("checkpoint must be an existing .pt file")
+        if _env_flag("ZING_COMPILE_FUSION"):
+            config = with_compile_fusion(config, True)
+            self.config = config
         self.generator = self._load_generator(config, checkpoint_path)
         compile_mode = os.environ.get("ZING_COMPILE", "").strip().lower()
         if compile_mode in {"generator", "max-autotune"}:
             mode = "max-autotune" if compile_mode == "max-autotune" else "default"
             self.generator = torch.compile(self.generator, dynamic=True, mode=mode)
         self.text_encoder = WanTextEncoder(pretrained_path, config.text_encoder.max_length)
-        self.text_encoder.eval().requires_grad_(False).to(device="cpu", dtype=torch.bfloat16)
+        encoder_device = self.device if self.keep_text_encoder else "cpu"
+        self.text_encoder.eval().requires_grad_(False).to(device=encoder_device, dtype=torch.bfloat16)
         self.vae = WanVAE(pretrained_path)
-        self.vae.eval().requires_grad_(False).to(device="cpu", dtype=torch.bfloat16)
+        vae_device = self.device if self.keep_vae else "cpu"
+        self.vae.eval().requires_grad_(False).to(device=vae_device, dtype=torch.bfloat16)
+        self.vae.prepare_runtime()
+        torch.set_float32_matmul_precision("high")
 
     def _unwrap_generator(self):
         return getattr(self.generator, "_orig_mod", self.generator)
@@ -77,8 +89,9 @@ class InferencePipeline:
         try:
             return self.vae.encode(frames).cpu()
         finally:
-            self.vae.to("cpu")
-            torch.cuda.empty_cache()
+            if not self.keep_vae:
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()
 
     @staticmethod
     def _known(latents: torch.Tensor, clean: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -115,13 +128,49 @@ class InferencePipeline:
         _synchronize()
         return output, time.perf_counter() - started
 
+    def _ensure_vae_device(self) -> None:
+        if next(self.vae.parameters()).device != self.device:
+            self.vae.to(self.device)
+
+    def _emit_vae_chunk(
+        self,
+        latents: torch.Tensor,
+        pixel_chunks: list[torch.Tensor],
+        vae_events: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+        *,
+        start_stream: bool,
+    ) -> None:
+        self._ensure_vae_device()
+        chunk = latents.contiguous()
+        stream = self._vae_stream
+        if stream is None:
+            if start_stream:
+                self.vae.begin_stream()
+            pixels = self.vae.decode_chunk(chunk)
+            pixel_chunks.append(pixels)
+            return
+        stream.wait_stream(torch.cuda.current_stream())
+        if start_stream:
+            with torch.cuda.stream(stream):
+                self.vae.begin_stream()
+        started = torch.cuda.Event(enable_timing=True)
+        finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(stream):
+            started.record()
+            pixels = self.vae.decode_chunk(chunk)
+            finished.record()
+        pixel_chunks.append(pixels)
+        vae_events.append((started, finished))
+
     def generate(self, request: InferenceRequest) -> torch.Tensor:
         wall_start = time.perf_counter()
         _synchronize()
         encode_start = time.perf_counter()
-        self.text_encoder.to(self.device)
+        if not self.keep_text_encoder:
+            self.text_encoder.to(self.device)
         contexts = [self.text_encoder.encode([prompt]) for prompt in request.prompts]
-        self.text_encoder.to("cpu")
+        if not self.keep_text_encoder:
+            self.text_encoder.to("cpu")
         _synchronize()
         encode_s = time.perf_counter() - encode_start
         clean = request.clean_latents.to(device=self.device, dtype=torch.bfloat16)
@@ -139,7 +188,40 @@ class InferencePipeline:
         dit_s = 0.0
         forwards = 0
         first_block_s = None
+        first_video_s = None
         pixel_scale = self.config.vae.temporal_scale
+        pixel_chunks: list[torch.Tensor] = []
+        vae_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        stream_started = False
+        vae_s = 0.0
+
+        def emit_vae(start: int, end: int) -> None:
+            nonlocal stream_started, first_video_s, vae_s
+            if not self.stream_vae:
+                return
+            if self.overlap_vae:
+                self._emit_vae_chunk(
+                    output[:, start:end],
+                    pixel_chunks,
+                    vae_events,
+                    start_stream=not stream_started,
+                )
+                stream_started = True
+                return
+            _synchronize()
+            started = time.perf_counter()
+            self._emit_vae_chunk(
+                output[:, start:end],
+                pixel_chunks,
+                vae_events,
+                start_stream=not stream_started,
+            )
+            _synchronize()
+            vae_s += time.perf_counter() - started
+            stream_started = True
+            if first_video_s is None:
+                first_video_s = time.perf_counter() - wall_start
+
         for start, end in request.chunk_spans:
             previous_segment = segment
             while segment + 1 < len(contexts) and start >= boundaries[segment + 1]:
@@ -171,6 +253,7 @@ class InferencePipeline:
                     dit_s += elapsed
                     forwards += 1
                 output[:, start:end] = current_clean
+                emit_vae(start, end)
                 continue
             scheduler = DmdScheduler(self.config.inference).to(self.device)
             cache_mode = "active" if keep_cache else None
@@ -202,26 +285,42 @@ class InferencePipeline:
             block_s = time.perf_counter() - block_start
             if first_block_s is None and bool(current_mask.any()):
                 first_block_s = block_s
-                if self.decode_per_block:
-                    self.vae.to(self.device)
+                if self.decode_per_block and not self.stream_vae:
+                    self._ensure_vae_device()
                     try:
                         _ = self.vae.decode(output[:, :end])
                     finally:
-                        self.vae.to("cpu")
-        del contexts, cache, latents, clean, mask, action
-        torch.cuda.empty_cache()
-        _synchronize()
-        vae_start = time.perf_counter()
-        self.vae.to(self.device)
-        try:
-            video = self.vae.decode(output)
+                        if not self.keep_vae:
+                            self.vae.to("cpu")
+            emit_vae(start, end)
+        if self.stream_vae:
+            if self._vae_stream is not None:
+                self._vae_stream.synchronize()
+                vae_s = sum(start.elapsed_time(end) for start, end in vae_events) / 1000.0
+                if first_video_s is None and vae_events:
+                    first_video_s = encode_s + (first_block_s or 0.0) + (vae_events[0][0].elapsed_time(vae_events[0][1]) / 1000.0)
+            video = torch.cat(pixel_chunks, dim=1)
             video = (video * 0.5 + 0.5).clamp(0, 1)
-            _synchronize()
-            vae_s = time.perf_counter() - vae_start
             cpu_video = video.cpu()
-        finally:
-            self.vae.to("cpu")
+            self.vae.end_stream()
+            if not self.keep_vae:
+                self.vae.to("cpu")
+        else:
+            del contexts, cache, latents, clean, mask, action
             torch.cuda.empty_cache()
+            _synchronize()
+            vae_start = time.perf_counter()
+            self._ensure_vae_device()
+            try:
+                video = self.vae.decode(output)
+                video = (video * 0.5 + 0.5).clamp(0, 1)
+                _synchronize()
+                vae_s = time.perf_counter() - vae_start
+                cpu_video = video.cpu()
+            finally:
+                if not self.keep_vae:
+                    self.vae.to("cpu")
+                    torch.cuda.empty_cache()
         wall_s = time.perf_counter() - wall_start
         pixel_frames = int(cpu_video.shape[1])
         finite = bool(torch.isfinite(cpu_video).all().item())
@@ -237,10 +336,15 @@ class InferencePipeline:
             "vae_s": vae_s,
             "wall_s": wall_s,
             "first_block_s": first_block_s,
+            "first_video_s": first_video_s,
             "dit_fps": (pixel_frames / dit_s) if dit_s > 0 else 0.0,
             "e2e_fps": (pixel_frames / wall_s) if wall_s > 0 else 0.0,
             "skip_cache_final": self.skip_cache_final,
             "decode_per_block": self.decode_per_block,
+            "keep_text_encoder": self.keep_text_encoder,
+            "stream_vae": self.stream_vae,
+            "keep_vae": self.keep_vae,
+            "overlap_vae": self.overlap_vae,
             "finite": finite,
             "frame_mean": frame_mean,
             "black_frac": black_frac,
