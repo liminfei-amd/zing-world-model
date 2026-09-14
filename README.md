@@ -53,12 +53,21 @@ The report describes joint keyboard and online text control, segment-level teach
 
 ## Requirements
 
+The default installation targets NVIDIA CUDA:
+
 - Linux
 - A CUDA-capable NVIDIA GPU
 - Python 3.11
 - Dependencies matching [requirements.txt](requirements.txt)
 
+ROCm inference is also available on compatible AMD GPUs through PyTorch SDPA.
+Install PyTorch for ROCm separately before installing
+[requirements-rocm.txt](requirements-rocm.txt); do not install the CUDA-only
+`flash-attn` package into the ROCm environment.
+
 ## Quick Start
+
+### NVIDIA CUDA
 
 Run commands from the repository root:
 
@@ -93,6 +102,62 @@ python examples/zing_0_5/client.py \
   --chunks 4 \
   --output outputs/forest
 ```
+
+### AMD ROCm
+
+Install a compatible PyTorch build by following the
+[official ROCm documentation](https://rocm.docs.amd.com/en/latest/), then
+install the remaining dependencies:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip wheel
+# Install a compatible PyTorch ROCm build using the official instructions.
+python -m pip install -r requirements-rocm.txt
+```
+
+Verify that the environment contains a working HIP build before loading the
+model:
+
+```bash
+python - <<'PY'
+import torch
+
+assert torch.cuda.is_available()
+assert torch.version.hip
+properties = torch.cuda.get_device_properties(0)
+print(torch.__version__, torch.version.hip, properties.gcnArchName)
+x = torch.randn(8, 8, device="cuda", dtype=torch.bfloat16)
+assert torch.isfinite(x @ x).all()
+PY
+```
+
+Run the five-frame smoke input with the math SDPA backend first:
+
+```bash
+ZING_ATTENTION_BACKEND=sdpa-math \
+ZING_PYTHON=/path/to/.venv/bin/python \
+bash run.sh \
+  --pretrained-dir /path/to/Zing-0.5/pretrained \
+  --checkpoint /path/to/Zing-0.5/generator/model.pt \
+  --messages examples/rocm_smoke.jsonl \
+  --output-dir outputs/rocm-smoke \
+  --local-attn-size 33 \
+  --sink-size 5 \
+  --seed 0
+```
+
+The default `auto` selection uses CUDA FlashAttention when it is installed and
+the portable SDPA math backend otherwise. `ZING_ATTENTION_BACKEND=sdpa` opts
+into PyTorch's automatic fused-backend selection; validate its output on the
+exact GPU and PyTorch build before relying on it. PyTorch uses the `torch.cuda`
+API and `cuda` device strings for both CUDA and ROCm.
+
+ROCm kernel availability and numerical behavior vary by GPU and PyTorch build.
+Inspect the generated smoke video; successful package import, device
+enumeration, or non-empty output alone is not a correctness result. Performance
+and numerical results can differ from CUDA FlashAttention.
 
 ## Ready-to-Run World Rollouts
 
