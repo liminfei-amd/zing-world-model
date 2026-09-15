@@ -148,16 +148,24 @@ bash run.sh \
   --seed 0
 ```
 
-The default `auto` selection uses CUDA FlashAttention when it is installed and
-the portable SDPA math backend otherwise. `ZING_ATTENTION_BACKEND=sdpa` opts
-into PyTorch's automatic fused-backend selection; validate its output on the
-exact GPU and PyTorch build before relying on it. PyTorch uses the `torch.cuda`
-API and `cuda` device strings for both CUDA and ROCm.
+The default `auto` selection requires external FlashAttention on CUDA and
+fails clearly if that package is absent. On ROCm, `auto` uses the portable SDPA
+math backend and chunks long query sequences to bound each estimated FP32
+attention-score allocation to 512 MiB. `ZING_ATTENTION_BACKEND=sdpa` opts into
+PyTorch's automatic fused-backend selection; validate its output on the exact
+GPU, PyTorch build, and production sequence length before relying on it.
+The 512 MiB limit covers the score estimate, not other backend intermediates or
+model memory, and chunked math is a compatibility path rather than a
+performance-equivalent replacement for fused attention.
+PyTorch uses the `torch.cuda` API and `cuda` device strings for both CUDA and
+ROCm.
 
 ROCm kernel availability and numerical behavior vary by GPU and PyTorch build.
 Inspect the generated smoke video; successful package import, device
-enumeration, or non-empty output alone is not a correctness result. Performance
-and numerical results can differ from CUDA FlashAttention.
+enumeration, or non-empty output alone is not a correctness result. The
+five-frame smoke also does not validate memory or performance at long-rollout
+sequence lengths. Performance and numerical results can differ from CUDA
+FlashAttention.
 
 ## Ready-to-Run World Rollouts
 

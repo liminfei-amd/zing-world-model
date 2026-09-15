@@ -145,15 +145,19 @@ bash run.sh \
   --seed 0
 ```
 
-默认的 `auto` 模式在已经安装 CUDA FlashAttention 时使用原实现，否则使用
-可移植的 SDPA 数学 backend。`ZING_ATTENTION_BACKEND=sdpa` 会让 PyTorch
-自动选择 fused backend；依赖它之前，必须在实际 GPU 和 PyTorch build 上
-验证输出。PyTorch 在 CUDA 和 ROCm 上都使用 `torch.cuda` API 和 `cuda`
-设备字符串。
+默认的 `auto` 模式在 CUDA 上要求 external FlashAttention；缺少该包时会
+明确报错。在 ROCm 上，`auto` 使用可移植的 SDPA 数学 backend，并对较长的
+query 序列分块，将每次调用估算的 FP32 attention score 控制在 512 MiB
+以内。`ZING_ATTENTION_BACKEND=sdpa` 会让 PyTorch 自动选择 fused backend；
+依赖它之前，必须在实际 GPU、PyTorch build 和生产序列长度上验证输出。
+512 MiB 只限制 score 估算，不包括 backend 的其他中间结果或模型显存；
+chunked math 是兼容路径，并不是 fused attention 的等性能替代。
+PyTorch 在 CUDA 和 ROCm 上都使用 `torch.cuda` API 和 `cuda` 设备字符串。
 
 ROCm kernel 的可用性和数值行为会随 GPU 与 PyTorch build 变化。请检查实际
 生成的 smoke 视频；仅仅成功导入包、枚举设备或生成非空文件不能证明结果
-正确。性能和数值结果可能与 CUDA FlashAttention 不同。
+正确。五帧 smoke 也不能验证长 rollout 序列长度下的内存和性能。性能和
+数值结果可能与 CUDA FlashAttention 不同。
 
 ## 开箱即用的推演示例
 

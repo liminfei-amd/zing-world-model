@@ -126,7 +126,7 @@ class SdpaVarlenFallbackTests(unittest.TestCase):
             },
         )
 
-    def test_auto_falls_back_to_sdpa_when_flash_is_unavailable(self) -> None:
+    def test_auto_uses_math_sdpa_on_rocm(self) -> None:
         torch.manual_seed(2)
         query_lengths = torch.tensor([2, 2], dtype=torch.int32)
         key_lengths = torch.tensor([3, 3], dtype=torch.int32)
@@ -135,6 +135,7 @@ class SdpaVarlenFallbackTests(unittest.TestCase):
 
         with (
             mock.patch.object(attention, "_flash_attn_varlen_func", None),
+            mock.patch.object(torch.version, "hip", "test-hip"),
             mock.patch.dict(os.environ, {"ZING_ATTENTION_BACKEND": "auto"}),
         ):
             actual = attention.flash_attention_varlen(
@@ -150,6 +151,15 @@ class SdpaVarlenFallbackTests(unittest.TestCase):
             torch.allclose(actual.float(), expected.float(), atol=1e-5, rtol=1e-4)
         )
 
+    def test_cuda_auto_fails_when_flash_attention_is_unavailable(self) -> None:
+        with (
+            mock.patch.object(attention, "_flash_attn_varlen_func", None),
+            mock.patch.object(torch.version, "hip", None),
+            mock.patch.dict(os.environ, {"ZING_ATTENTION_BACKEND": "auto"}),
+            self.assertRaisesRegex(ImportError, "auto requires the CUDA flash-attn"),
+        ):
+            attention._resolve_attention_backend()
+
     def test_auto_does_not_select_cuda_flash_attention_on_rocm(self) -> None:
         with (
             mock.patch.object(attention, "_flash_attn_varlen_func", mock.Mock()),
@@ -157,6 +167,108 @@ class SdpaVarlenFallbackTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"ZING_ATTENTION_BACKEND": "auto"}),
         ):
             self.assertEqual(attention._resolve_attention_backend(), "sdpa-math")
+
+    def test_math_query_chunk_size_respects_score_budget(self) -> None:
+        query = torch.empty(1, 2, 5, 8)
+        key = torch.empty(1, 2, 4, 8)
+        with mock.patch.object(
+            attention,
+            "_MATH_SDPA_SCORE_BUDGET_BYTES",
+            64,
+        ):
+            self.assertEqual(attention._math_sdpa_query_chunk_size(query, key), 2)
+
+    def test_math_query_chunk_size_bounds_production_shape(self) -> None:
+        query = torch.empty(1, 24, 3520, 128, device="meta", dtype=torch.bfloat16)
+        key = torch.empty(1, 24, 64240, 128, device="meta", dtype=torch.bfloat16)
+        chunk_size = attention._math_sdpa_query_chunk_size(query, key)
+        estimated_score_bytes = (
+            query.shape[0]
+            * query.shape[1]
+            * chunk_size
+            * key.shape[-2]
+            * attention._MATH_SDPA_SCORE_ELEMENT_BYTES
+        )
+
+        self.assertEqual(chunk_size, 64)
+        self.assertLessEqual(
+            estimated_score_bytes,
+            attention._MATH_SDPA_SCORE_BUDGET_BYTES,
+        )
+
+    def test_chunked_math_matches_naive_attention(self) -> None:
+        torch.manual_seed(3)
+        query_lengths = torch.tensor([5, 3], dtype=torch.int32)
+        key_lengths = torch.tensor([4, 6], dtype=torch.int32)
+        query, key, value = _inputs(query_lengths, key_lengths)
+        expected = _naive_varlen(query, key, value, query_lengths, key_lengths)
+
+        with (
+            mock.patch.object(
+                attention,
+                "_MATH_SDPA_SCORE_BUDGET_BYTES",
+                64,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"ZING_ATTENTION_BACKEND": "sdpa-math"},
+            ),
+            mock.patch.object(
+                attention,
+                "_scaled_dot_product_attention",
+                wraps=attention._scaled_dot_product_attention,
+            ) as sdpa,
+        ):
+            actual = attention.flash_attention_varlen(
+                query,
+                key,
+                value,
+                query_lengths,
+                key_lengths,
+                deterministic=False,
+            )
+
+        self.assertGreater(sdpa.call_count, len(query_lengths))
+        self.assertTrue(
+            torch.allclose(actual.float(), expected.float(), atol=1e-5, rtol=1e-4)
+        )
+
+    def test_chunked_equal_length_math_matches_naive_attention(self) -> None:
+        torch.manual_seed(4)
+        query_lengths = torch.tensor([5, 5], dtype=torch.int32)
+        key_lengths = torch.tensor([6, 6], dtype=torch.int32)
+        query, key, value = _inputs(query_lengths, key_lengths)
+        expected = _naive_varlen(query, key, value, query_lengths, key_lengths)
+
+        with (
+            mock.patch.object(
+                attention,
+                "_MATH_SDPA_SCORE_BUDGET_BYTES",
+                192,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"ZING_ATTENTION_BACKEND": "sdpa-math"},
+            ),
+            mock.patch.object(
+                attention,
+                "_scaled_dot_product_attention",
+                wraps=attention._scaled_dot_product_attention,
+            ) as sdpa,
+        ):
+            actual = attention.flash_attention_varlen(
+                query,
+                key,
+                value,
+                query_lengths,
+                key_lengths,
+                deterministic=False,
+            )
+
+        self.assertEqual(sdpa.call_count, 3)
+        self.assertTrue(
+            torch.allclose(actual.float(), expected.float(), atol=1e-5, rtol=1e-4)
+        )
 
     def test_explicit_flash_fails_when_package_is_unavailable(self) -> None:
         query_lengths = torch.tensor([1], dtype=torch.int32)
